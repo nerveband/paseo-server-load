@@ -1,0 +1,571 @@
+#!/usr/bin/python3
+"""Memory-pressure gate and watchdog for a macOS machine that runs many coding agents.
+
+  server-pressure status [--json]            current level and reasons
+  server-pressure gate [--kind spawn|heavy] [--max-wait SEC] [--json]
+                                             wait while the level blocks this kind of work;
+                                             exit 0 = go, 75 = still blocked after max-wait
+  server-pressure watchdog                   one launchd tick: sample, pause/resume heavy
+                                             jobs, reap known orphans, archive idle agents
+  server-pressure off [all|gate|pause|reap|archive ...]
+  server-pressure on  [all|gate|pause|reap|archive ...]
+                                             switch features off or back on (default: all).
+                                             gate = omp/agent waiting, pause = SIGSTOP heavy jobs,
+                                             reap = kill leftover test browsers and dev servers,
+                                             archive = auto-archive idle Paseo subagents.
+                                             Sampling and `status` keep working while off.
+  server-pressure archived [--json] [--limit N]   agents the watchdog archived, newest first
+  server-pressure restore <agent-id>         unarchive and reload one (no prompt is sent)
+  server-pressure config                     effective settings and where they came from
+
+Settings: ~/.config/server-pressure/config.json (see README for every key).
+
+Levels: green (normal), yellow (elevated), red (thrashing).
+spawn = new agents or subagents; heavy = renders, ML, builds, test suites.
+  red    → spawn and heavy wait
+  yellow → heavy waits while another heavy job runs; spawn waits above SPAWN_CAP_YELLOW
+  green  → spawn waits above SPAWN_CAP_GREEN
+"""
+import calendar
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(HOME, ".config/server-pressure/config.json")
+STATE_DIR = os.path.join(HOME, ".local/state/server-pressure")
+STATE = os.path.join(STATE_DIR, "state.json")
+SWITCHES = os.path.join(STATE_DIR, "switches.json")
+LEDGER = os.path.join(STATE_DIR, "archived.jsonl")
+FEATURES = ("gate", "pause", "reap", "archive")
+LOG = os.path.join(HOME, "Library/Logs/server-pressure.log")
+PASEO = shutil.which("paseo") or os.path.join(HOME, ".local/bin/paseo")
+PAGE = 16384
+
+# Thresholds. memorystatus_level is the kernel's "% memory available".
+RED_AVAIL, YELLOW_AVAIL = 10, 20
+RED_SWAPIN_MBS, YELLOW_SWAPIN_MBS = 40.0, 8.0
+RED_LOAD_PER_CPU, YELLOW_LOAD_PER_CPU = 4.0, 2.0
+SPAWN_CAP_GREEN, SPAWN_CAP_YELLOW = 24, 16   # live agent CLIs under the Paseo daemon
+STATE_FRESH_S = 150
+EXIT_RED_SAMPLES = 2          # consecutive non-red ticks before leaving red
+MAX_PAUSE_S = 20 * 60         # never keep a job stopped longer than this
+ARCHIVE_EVERY_S = 3600
+ARCHIVE_SUBAGENT_IDLE_H = 6  # subagents only, and only once their parent is idle this long too
+ORPHAN_MIN_AGE_S = 2 * 3600
+DEVSERVER_MIN_AGE_S = 48 * 3600
+
+# Processes the watchdog may pause (SIGSTOP) under red. Pure local compute only.
+PAUSABLE = re.compile(r"(^|/)(ffmpeg|rembg|whisper(-cli)?|demucs)( |$)|/bin/rembg |hyperframes[^ ]* render|remotion[^ ]* render")
+# Orphans (parent launchd, not a launchd job) that are always leftovers.
+ORPHANS = [
+    re.compile(r"/var/folders/[^ ]+/T/Test[^/ ]+/"),                                  # go test temp scripts
+    re.compile(r"ms-playwright/.+/Contents/MacOS/Google Chrome for Testing( |$)"),     # playwright browser
+    re.compile(r"\.omp/puppeteer/.+/Contents/MacOS/Google Chrome for Testing( |$)"),   # omp headless browser
+]
+DEVSERVER = re.compile(r"\b(astro|vite|next|nuxt|remix|wrangler) dev\b")
+AGENT_CLI = re.compile(r"^(\S*/)?(omp|claude|codex|pi|opencode|antigravity|agy)( |$)")
+
+# config.json key → (setting, multiplier to internal units). Values are plain numbers.
+CONFIG_KEYS = {
+    "red_mem_available_pct": ("RED_AVAIL", 1),
+    "yellow_mem_available_pct": ("YELLOW_AVAIL", 1),
+    "red_swapin_mb_per_s": ("RED_SWAPIN_MBS", 1),
+    "yellow_swapin_mb_per_s": ("YELLOW_SWAPIN_MBS", 1),
+    "red_load_per_cpu": ("RED_LOAD_PER_CPU", 1),
+    "yellow_load_per_cpu": ("YELLOW_LOAD_PER_CPU", 1),
+    "spawn_cap_green": ("SPAWN_CAP_GREEN", 1),
+    "spawn_cap_yellow": ("SPAWN_CAP_YELLOW", 1),
+    "max_pause_minutes": ("MAX_PAUSE_S", 60),
+    "archive_subagent_idle_hours": ("ARCHIVE_SUBAGENT_IDLE_H", 1),
+    "orphan_min_age_hours": ("ORPHAN_MIN_AGE_S", 3600),
+    "devserver_min_age_hours": ("DEVSERVER_MIN_AGE_S", 3600),
+}
+CONFIG_ERRORS = []
+
+
+def apply_config():
+    """Override the defaults above from config.json. Bad entries are reported, never fatal."""
+    try:
+        with open(CONFIG) as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        CONFIG_ERRORS.append("%s: %s" % (CONFIG, e))
+        return
+    for key, value in user.items():
+        if key == "paseo" and isinstance(value, str):
+            globals()["PASEO"] = os.path.expanduser(value)
+        elif key in CONFIG_KEYS and isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            name, scale = CONFIG_KEYS[key]
+            globals()[name] = value * scale
+        else:
+            CONFIG_ERRORS.append("ignored %s=%r" % (key, value))
+
+
+def cmd_config(_args):
+    print("file: %s%s" % (CONFIG, "" if os.path.exists(CONFIG) else " (not present, using defaults)"))
+    for key, (name, scale) in CONFIG_KEYS.items():
+        print("  %s = %g" % (key, globals()[name] / scale))
+    print("  paseo = %s" % PASEO)
+    for err in CONFIG_ERRORS:
+        print("warning: " + err)
+    return 0
+
+
+def sh(*args, timeout=20):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    try:
+        if os.path.getsize(LOG) > 5 * 1024 * 1024:
+            os.replace(LOG, LOG + ".1")
+    except OSError:
+        pass
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def sysctl(name):
+    try:
+        return int(sh("/usr/sbin/sysctl", "-n", name).strip())
+    except ValueError:
+        return None
+
+
+def swapins():
+    m = re.search(r"Swapins:\s+(\d+)", sh("/usr/bin/vm_stat"))
+    return int(m.group(1)) if m else 0
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def etime_s(s):
+    days, _, rest = s.partition("-") if "-" in s else ("0", "", s)
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def processes():
+    out = sh("/bin/ps", "-Ao", "pid=,ppid=,pgid=,etime=,stat=,command=")
+    procs = []
+    for line in out.splitlines():
+        f = line.split(None, 5)
+        if len(f) < 6:
+            continue
+        procs.append({"pid": int(f[0]), "ppid": int(f[1]), "pgid": int(f[2]),
+                      "age": etime_s(f[3]), "stat": f[4], "cmd": f[5]})
+    return procs
+
+
+def agent_count(procs):
+    daemon = [p["pid"] for p in procs if p["cmd"].startswith("Paseo Daemon")]
+    return sum(1 for p in procs if p["ppid"] in daemon and AGENT_CLI.match(p["cmd"]))
+
+
+def heavy_jobs(procs):
+    return [p for p in procs if PAUSABLE.search(p["cmd"]) and "server-pressure" not in p["cmd"]]
+
+
+def classify(avail, plevel, swapin_mbs, load1, ncpu):
+    red, yellow = [], []
+    if plevel == 4:
+        red.append("kernel pressure critical")
+    elif plevel == 2:
+        yellow.append("kernel pressure warn")
+    if avail is not None and avail <= RED_AVAIL:
+        red.append("memory available %d%%" % avail)
+    elif avail is not None and avail <= YELLOW_AVAIL:
+        yellow.append("memory available %d%%" % avail)
+    if swapin_mbs >= RED_SWAPIN_MBS:
+        red.append("swap-in %.0f MB/s" % swapin_mbs)
+    elif swapin_mbs >= YELLOW_SWAPIN_MBS:
+        yellow.append("swap-in %.0f MB/s" % swapin_mbs)
+    if load1 >= RED_LOAD_PER_CPU * ncpu:
+        red.append("load %.0f on %d cores" % (load1, ncpu))
+    elif load1 >= YELLOW_LOAD_PER_CPU * ncpu:
+        yellow.append("load %.0f on %d cores" % (load1, ncpu))
+    if red:
+        return "red", red + yellow
+    return ("yellow", yellow) if yellow else ("green", [])
+
+
+def sample(prev=None, live_window=1.0):
+    """Measure now. Swap-in rate comes from the previous sample, else a short live window."""
+    now = time.time()
+    s1 = swapins()
+    if prev and prev.get("swapins") is not None and 0 < now - prev.get("ts", 0) < 600:
+        rate = max(0, s1 - prev["swapins"]) * PAGE / (now - prev["ts"]) / 1e6
+    else:
+        time.sleep(live_window)
+        s2 = swapins()
+        rate = max(0, s2 - s1) * PAGE / live_window / 1e6
+        s1, now = s2, time.time()
+    ncpu = sysctl("hw.ncpu") or 1
+    load1 = os.getloadavg()[0]
+    avail = sysctl("kern.memorystatus_level")
+    plevel = sysctl("kern.memorystatus_vm_pressure_level")
+    level, reasons = classify(avail, plevel, rate, load1, ncpu)
+    procs = processes()
+    return {"ts": now, "level": level, "raw_level": level, "reasons": reasons,
+            "mem_available_pct": avail, "kernel_pressure": plevel, "swapin_mbs": round(rate, 1),
+            "swapins": s1, "load1": round(load1, 1), "ncpu": ncpu,
+            "agents": agent_count(procs), "heavy_jobs": len(heavy_jobs(procs))}
+
+
+def current():
+    st = load_state()
+    if st and time.time() - st.get("ts", 0) < STATE_FRESH_S:
+        return st
+    return sample()
+
+
+def blocked(st, kind):
+    level = st["level"]
+    if level == "red":
+        return "memory pressure red (%s)" % ", ".join(st["reasons"])
+    if kind == "heavy" and level == "yellow" and st.get("heavy_jobs", 0) >= 1:
+        return "memory pressure yellow (%s) and another heavy job is running" % ", ".join(st["reasons"])
+    if kind == "spawn":
+        cap = SPAWN_CAP_YELLOW if level == "yellow" else SPAWN_CAP_GREEN
+        if st.get("agents", 0) >= cap:
+            return "%d live agents at %s (cap %d)" % (st["agents"], level, cap)
+    return None
+
+
+def cmd_status(args):
+    st = dict(current())
+    st.setdefault("paused", load_state().get("paused", []))
+    st["switches"] = switches()
+    st["config_errors"] = CONFIG_ERRORS
+    if "--json" in args:
+        print(json.dumps(st))
+        return 0
+    print("%s  avail=%s%%  swap-in=%s MB/s  load=%s/%s cores  agents=%s  heavy=%s%s" % (
+        st["level"].upper(), st["mem_available_pct"], st["swapin_mbs"], st["load1"], st["ncpu"],
+        st["agents"], st["heavy_jobs"], ("  (" + "; ".join(st["reasons"]) + ")") if st["reasons"] else ""))
+    if st.get("paused"):
+        print("paused jobs: " + ", ".join(str(p["pid"]) for p in st["paused"]))
+    off = [f for f, on in switches().items() if not on]
+    if off:
+        print("switched off: " + ", ".join(off))
+    return 0
+
+
+def switches():
+    try:
+        with open(SWITCHES) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    return {f: bool(saved.get(f, True)) for f in FEATURES}
+
+
+def cmd_switch(turn_on, args):
+    names = args or ["all"]
+    if "all" in names:
+        names = list(FEATURES)
+    bad = [n for n in names if n not in FEATURES]
+    if bad:
+        print("unknown feature: %s (choose from all, %s)" % (", ".join(bad), ", ".join(FEATURES)))
+        return 2
+    sw = switches()
+    for n in names:
+        sw[n] = turn_on
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(SWITCHES, "w") as f:
+        json.dump(sw, f)
+    log("switch %s: %s" % ("on" if turn_on else "off", ", ".join(names)))
+    if not sw["pause"]:
+        st = load_state()
+        for p in st.get("paused", []):
+            cont(p["pid"])
+            log("resume pid %d (pause switched off)" % p["pid"])
+        if st.get("paused"):
+            st["paused"] = []
+            save_state(st)
+    print("on: %s" % (", ".join(f for f in FEATURES if sw[f]) or "none"))
+    print("off: %s" % (", ".join(f for f in FEATURES if not sw[f]) or "none"))
+    return 0
+
+
+def cmd_gate(args):
+    kind = "spawn"
+    max_wait = 600
+    if "--kind" in args:
+        kind = args[args.index("--kind") + 1]
+    if "--max-wait" in args:
+        max_wait = int(args[args.index("--max-wait") + 1])
+    start = time.time()
+    if not switches()["gate"]:
+        if "--json" in args:
+            print(json.dumps({"ok": True, "kind": kind, "waited_s": 0, "level": "off", "reasons": [], "blocked_by": None}))
+        else:
+            print("GO (gate switched off)")
+        return 0
+    st = current()
+    why = blocked(st, kind)
+    while why and time.time() - start < max_wait:
+        time.sleep(min(15, max(1, max_wait - (time.time() - start))))
+        st = current()
+        why = blocked(st, kind)
+    waited = int(time.time() - start)
+    result = {"ok": why is None, "kind": kind, "waited_s": waited, "level": st["level"],
+              "reasons": st["reasons"], "blocked_by": why}
+    if "--json" in args:
+        print(json.dumps(result))
+    elif why:
+        print("BLOCKED after %ds: %s" % (waited, why))
+    else:
+        print("GO (%s%s)" % (st["level"], ", waited %ds" % waited if waited else ""))
+    return 0 if why is None else 75
+
+
+def launchd_pids():
+    pids = set()
+    for line in sh("/bin/launchctl", "list").splitlines()[1:]:
+        f = line.split()
+        if f and f[0].isdigit():
+            pids.add(int(f[0]))
+    return pids
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cont(pid):
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except OSError:
+        pass
+
+
+def pause_resume(st, prev, procs):
+    paused = [p for p in prev.get("paused", []) if alive(p["pid"])]
+    now = time.time()
+    # Safety valve: nothing stays stopped longer than MAX_PAUSE_S.
+    for p in [p for p in paused if now - p["since"] > MAX_PAUSE_S]:
+        cont(p["pid"])
+        log("resume pid %d (max pause reached): %s" % (p["pid"], p["cmd"][:120]))
+        paused.remove(p)
+    if st["level"] == "red":
+        running = sorted([p for p in heavy_jobs(procs) if "T" not in p["stat"]], key=lambda p: -p["age"])
+        # Keep the oldest heavy job going so the big work finishes; stop the newer ones.
+        for p in running[1:]:
+            try:
+                os.kill(p["pid"], signal.SIGSTOP)
+            except OSError:
+                continue
+            paused.append({"pid": p["pid"], "since": now, "cmd": p["cmd"][:200]})
+            log("pause pid %d (red): %s" % (p["pid"], p["cmd"][:120]))
+    elif paused:
+        # Resume one per tick, oldest pause first, so load returns gradually.
+        p = min(paused, key=lambda p: p["since"])
+        cont(p["pid"])
+        log("resume pid %d (%s): %s" % (p["pid"], st["level"], p["cmd"][:120]))
+        paused.remove(p)
+    st["paused"] = paused
+
+
+def reap_orphans(procs):
+    managed = launchd_pids()
+    for p in procs:
+        if p["ppid"] != 1 or p["pid"] in managed or p["pgid"] in managed:
+            continue
+        if p["age"] >= ORPHAN_MIN_AGE_S and any(r.search(p["cmd"]) for r in ORPHANS):
+            target, why = p["pid"], "orphan"
+        elif p["age"] >= DEVSERVER_MIN_AGE_S and DEVSERVER.search(p["cmd"]) and p["pgid"] == p["pid"]:
+            target, why = -p["pgid"], "orphan dev server group"
+        else:
+            continue
+        try:
+            os.kill(target, signal.SIGTERM)
+            log("reap %s pid %d age %dh: %s" % (why, p["pid"], p["age"] // 3600, p["cmd"][:160]))
+        except OSError:
+            pass
+
+
+def iso_age_h(iso):
+    if not iso:
+        return None
+    t = calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
+    return (time.time() - t) / 3600
+
+
+def agent_record(agent_id):
+    files = glob.glob(os.path.join(HOME, ".paseo/agents/*/%s.json" % agent_id))
+    try:
+        return json.load(open(files[0])) if files else None
+    except (OSError, ValueError):
+        return None
+
+
+def idle_hours(rec):
+    return iso_age_h(rec.get("lastActivityAt") or rec.get("updatedAt")) if rec else None
+
+
+def archive_idle_agents():
+    """Archive idle subagents. Threads you started are never archived automatically."""
+    out = sh(PASEO, "ls", "-g", "--background", "--json", timeout=60)
+    try:
+        agents = json.loads(out)
+    except ValueError:
+        log("archive skipped: paseo ls failed")
+        return
+    for a in agents:
+        if a.get("status") not in ("idle", "closed"):
+            continue
+        rec = agent_record(a["id"])
+        parent_id = ((rec or {}).get("labels") or {}).get("paseo.parent-agent-id")
+        if not parent_id:
+            continue
+        idle_h = idle_hours(rec)
+        if idle_h is None or idle_h < ARCHIVE_SUBAGENT_IDLE_H:
+            continue
+        # A parent still at work may come back to this subagent.
+        parent_idle = idle_hours(agent_record(parent_id))
+        if parent_idle is not None and parent_idle < ARCHIVE_SUBAGENT_IDLE_H:
+            continue
+        sh(PASEO, "archive", a["id"], "-q", timeout=60)
+        ledger_add(a, rec, "subagent idle %.0fh" % idle_h)
+        log("archive subagent %s idle %.0fh: %s" % (a["shortId"], idle_h, a["name"][:80]))
+
+
+def ledger_add(agent, rec, reason):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps({"id": agent["id"], "shortId": agent.get("shortId", agent["id"][:7]),
+                            "name": agent.get("name") or (rec or {}).get("title") or "",
+                            "cwd": agent.get("cwd") or (rec or {}).get("cwd") or "",
+                            "archivedAt": time.time(), "reason": reason}) + "\n")
+
+
+def ledger_entries(limit):
+    """Newest first, one row per agent, with whether it is still archived now."""
+    try:
+        lines = open(LEDGER).read().splitlines()
+    except OSError:
+        return []
+    seen, rows = set(), []
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        rec = agent_record(row["id"])
+        row["stillArchived"] = bool(rec and rec.get("archivedAt"))
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def cmd_archived(args):
+    limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 50
+    rows = ledger_entries(limit)
+    if "--json" in args:
+        print(json.dumps(rows))
+        return 0
+    for r in rows:
+        print("%s  %s  %-9s %s  (%s)" % (r["shortId"], time.strftime("%Y-%m-%d %H:%M", time.localtime(r["archivedAt"])),
+                                       "archived" if r["stillArchived"] else "restored", r["name"][:70], r["reason"]))
+    return 0
+
+
+def cmd_restore(args):
+    if not args:
+        print("usage: server-pressure restore <agent id or prefix>")
+        return 2
+    res = subprocess.run([PASEO, "agent", "reload", args[0]], capture_output=True, text=True, timeout=120)
+    log("restore agent %s: %s" % (args[0], "ok" if res.returncode == 0 else "failed"))
+    sys.stdout.write(res.stdout)
+    sys.stderr.write(res.stderr)
+    return res.returncode
+
+
+def notify(text):
+    sh("/usr/bin/osascript", "-e", 'display notification "%s" with title "server-pressure"' % text.replace('"', "'"))
+
+
+def cmd_watchdog(_args):
+    prev = load_state()
+    st = sample(prev)
+    # Hysteresis: stay red until EXIT_RED_SAMPLES consecutive non-red samples.
+    calm = prev.get("calm_samples", 0) + 1 if st["raw_level"] != "red" else 0
+    if prev.get("level") == "red" and st["raw_level"] != "red" and calm < EXIT_RED_SAMPLES:
+        st["level"] = "red"
+        st["reasons"] = ["recovering (%d/%d calm samples)" % (calm, EXIT_RED_SAMPLES)] + st["reasons"]
+    st["calm_samples"] = calm
+    if st["level"] != prev.get("level"):
+        log("level %s -> %s: %s" % (prev.get("level", "?"), st["level"], "; ".join(st["reasons"]) or "normal"))
+        if st["level"] == "red":
+            notify("Memory pressure RED: new agents and heavy jobs are waiting")
+    procs = processes()
+    sw = switches()
+    if sw["pause"]:
+        pause_resume(st, prev, procs)
+    else:
+        for p in prev.get("paused", []):
+            cont(p["pid"])
+        st["paused"] = []
+    if sw["reap"]:
+        reap_orphans(procs)
+    st["last_archive"] = prev.get("last_archive", 0)
+    if sw["archive"] and time.time() - st["last_archive"] >= ARCHIVE_EVERY_S:
+        archive_idle_agents()
+        st["last_archive"] = time.time()
+    save_state(st)
+    return 0
+
+
+def main():
+    apply_config()
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    fn = {"status": cmd_status, "gate": cmd_gate, "watchdog": cmd_watchdog,
+          "archived": cmd_archived, "restore": cmd_restore, "config": cmd_config,
+          "on": lambda a: cmd_switch(True, a), "off": lambda a: cmd_switch(False, a)}.get(cmd)
+    if not fn:
+        print(__doc__)
+        return 2
+    return fn(args[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
