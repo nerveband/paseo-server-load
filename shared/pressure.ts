@@ -9,26 +9,48 @@ export const FEATURES: readonly Feature[] = featureSchema.options;
 export const SSH_HOST = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/;
 /** Path to server-pressure on the watched Mac; `~` expands there. */
 export const COMMAND_PATH = /^~?[A-Za-z0-9._/-]+$/;
+export const DEFAULT_COMMAND = "~/.local/bin/server-pressure";
+export const REPO_URL = "https://github.com/nerveband/paseo-server-load.git";
 
-export const connectionSettings = defineSettings({
+export const machineSchema = z.object({
+  id: z.string().min(1),
+  /** Shown in the machine picker; defaults to the hostname or SSH host. */
+  label: z.string().trim().default(""),
+  /** `local`: the Mac this Paseo daemon runs on. `ssh`: another Mac reached through SSH. */
+  mode: z.enum(["local", "ssh"]).default("local"),
+  sshHost: z.string().trim().default(""),
+  command: z.string().trim().default(DEFAULT_COMMAND),
+});
+export type Machine = z.infer<typeof machineSchema>;
+
+export const LOCAL_MACHINE: Machine = { id: "local", label: "", mode: "local", sshHost: "", command: DEFAULT_COMMAND };
+
+export const machinesSettings = defineSettings({
   id: "connection",
   scope: "host",
-  version: 1,
+  version: 2,
   schema: z.object({
-    /** `local`: watch the Mac this daemon runs on. `ssh`: watch another Mac through SSH. */
-    mode: z.enum(["local", "ssh"]).default("local"),
-    sshHost: z.string().trim().default(""),
-    command: z.string().trim().default("~/.local/bin/server-pressure"),
-    /** Shown as the machine name; defaults to the hostname or SSH host. */
-    label: z.string().trim().default(""),
+    machines: z.array(machineSchema).min(1).default([LOCAL_MACHINE]),
   }),
+  // Version 1 stored a single machine at the top level.
+  migrate: (values, fromVersion) => {
+    if (fromVersion >= 2 || !values || typeof values !== "object") return values;
+    const v1 = values as Partial<Machine>;
+    return { machines: [{ ...LOCAL_MACHINE, ...v1, id: v1.mode === "ssh" && v1.sshHost ? `ssh-${v1.sshHost}` : "local" }] };
+  },
 });
-export type ConnectionSettings = z.infer<typeof connectionSettings.schema>;
+export type MachinesSettings = z.infer<typeof machinesSettings.schema>;
+
+/** What the plugin found when it ran server-pressure on a machine. */
+export const reachSchema = z.enum(["ok", "not-installed", "unreachable", "misconfigured", "failed"]);
+
+const machineInput = z.object({ machineId: z.string().min(1) });
 
 export const pressureStatusSchema = z.object({
-  /** Machine the numbers describe and how this daemon reached it. */
+  machineId: z.string(),
   host: z.string(),
   via: z.enum(["local", "ssh"]),
+  reach: reachSchema,
   level: z.enum(["green", "yellow", "red"]).nullable(),
   reasons: z.array(z.string()),
   memAvailablePct: z.number().nullable(),
@@ -48,13 +70,13 @@ export type PressureStatus = z.infer<typeof pressureStatusSchema>;
 
 export const getPressureStatus = defineRpc({
   name: "server-pressure.status",
-  input: z.object({}),
+  input: machineInput,
   output: pressureStatusSchema,
 });
 
 export const setPressureFeatures = defineRpc({
   name: "server-pressure.set",
-  input: z.object({ features: z.array(featureSchema).min(1), on: z.boolean() }),
+  input: machineInput.extend({ features: z.array(featureSchema).min(1), on: z.boolean() }),
   output: pressureStatusSchema,
 });
 
@@ -76,12 +98,12 @@ export const archivedListSchema = z.object({
 
 export const getArchivedAgents = defineRpc({
   name: "server-pressure.archived",
-  input: z.object({}),
+  input: machineInput,
   output: archivedListSchema,
 });
 
 export const restoreArchivedAgent = defineRpc({
   name: "server-pressure.restore",
-  input: z.object({ id: z.string().regex(/^[0-9a-f-]{7,36}$/) }),
+  input: machineInput.extend({ id: z.string().regex(/^[0-9a-f-]{7,36}$/) }),
   output: archivedListSchema,
 });

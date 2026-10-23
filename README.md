@@ -15,7 +15,16 @@ It was built for a 16 GB M1 Pro that hosts a Paseo daemon with a dozen or more O
 
 ## Install
 
-On the Mac you want to watch:
+Server Load has two parts, and you need both:
+
+1. **The tools**, on every Mac you want to watch. They do the actual work: the watchdog, the wait gate, and the switches.
+2. **The plugin**, in every Paseo daemon you want to see it from. It is only the dashboard and does nothing on its own.
+
+If a machine is missing the tools, the Server Load screen says so and shows the exact command to run.
+
+### 1. Tools (macOS, on each watched Mac)
+
+Requires macOS and the system `/usr/bin/python3` (Python 3.9 or later, standard library only). `git` is the only other thing you need.
 
 ```bash
 git clone https://github.com/nerveband/paseo-server-load.git ~/src/paseo-server-load
@@ -23,13 +32,30 @@ git clone https://github.com/nerveband/paseo-server-load.git ~/src/paseo-server-
 server-pressure status
 ```
 
-Then install the plugin into each Paseo daemon that should show it:
+`install.sh` links `~/.local/bin/server-pressure`, links the Oh My Pi extension into `~/.omp/agent/extensions/` when `omp` is installed, and loads a launchd job (`io.github.nerveband.server-pressure`) that runs the watchdog every minute. It needs no `sudo`. To install on a machine you reach over SSH, run the same two lines there, or from your own Mac:
+
+```bash
+ssh <host> 'git clone https://github.com/nerveband/paseo-server-load.git ~/src/paseo-server-load && ~/src/paseo-server-load/tools/install.sh'
+```
+
+To update later: `git -C ~/src/paseo-server-load pull && ~/src/paseo-server-load/tools/install.sh`.
+
+### 2. Plugin (in each Paseo daemon)
 
 ```bash
 paseo plugin install git:nerveband/paseo-server-load
 ```
 
-To control the watched Mac from another machine, install the plugin on that machine's daemon too, open **Settings → Plugins**, choose **Server Load** from the server-load actions menu, pick **Another Mac over SSH**, and enter an SSH host. The host must log in without a prompt, so use an `~/.ssh/config` alias with a key that does not need an agent confirmation.
+Paseo 0.9.2 or later. The plugin appears as **Server Load** in the sidebar and in the command center.
+
+## Watching several machines
+
+Open **Settings → Plugins**, pick **Server Load** from the server-load actions menu (or run **Server Load settings** from the command center), and add a machine for each Mac you want to watch:
+
+- **This Mac** is the Mac the Paseo daemon runs on.
+- **Another Mac over SSH** runs `server-pressure` through `ssh` from the daemon's Mac. Use an `~/.ssh/config` alias or `user@host`, with a key that logs in without a prompt (the plugin uses SSH BatchMode, so 1Password or other agents that ask for approval will not work). Check it with `ssh -o BatchMode=yes <host> true`.
+
+The Server Load screen shows a button per machine at the top; tap one to switch. The first machine in the list opens by default, and **Move up** changes the order. A typical setup is a laptop daemon with two machines (the laptop itself and the server over SSH) and a server daemon with just **This Mac**.
 
 ## Levels
 
@@ -59,14 +85,14 @@ Agents that are not Oh My Pi can follow the same rule by running `server-pressur
 
 ## Settings
 
-### Plugin (Settings → Plugins → server-load → Server Load, per Paseo daemon)
+### Plugin machines (Settings → Plugins → server-load → Server Load, per Paseo daemon)
 
-| Setting | Default | Meaning |
+| Field | Default | Meaning |
 |---|---|---|
-| Machine to watch | This Mac | **This Mac** runs the command where the daemon runs. **Another Mac over SSH** runs it through SSH. |
+| This Mac / Another Mac over SSH | This Mac | Where `server-pressure` runs. |
 | SSH host | empty | `~/.ssh/config` alias or `user@host`. Letters, digits, `.`, `_`, `@`, `-` only. |
-| server-pressure command | `~/.local/bin/server-pressure` | Path on the watched Mac. |
-| Display name | hostname or SSH host | Shown under the title. |
+| Name | hostname or SSH host | Label on the machine button. |
+| server-pressure command | `~/.local/bin/server-pressure` | Path on that Mac. |
 
 ### Watchdog (`~/.config/server-pressure/config.json` on the watched Mac)
 

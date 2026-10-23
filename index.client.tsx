@@ -21,6 +21,15 @@ export default function contribute(client: PluginClientContext) {
       openSurface("main");
     },
   });
+  client.addCommandCenterItem({
+    id: "server-load-settings",
+    title: "Server Load settings: add or edit machines",
+    icon: "Activity",
+    context: "global",
+    onSelect({ openSettings }) {
+      openSettings("connection");
+    },
+  });
   client.addSettingsScreen({
     id: "connection",
     title: "Server Load",

@@ -8,52 +8,91 @@ import {
   FEATURES,
   SSH_HOST,
   type ArchivedAgent,
-  type ConnectionSettings,
+  type Machine,
   type PressureStatus,
-  type connectionSettings,
+  type getArchivedAgents,
+  type getPressureStatus,
+  type machinesSettings,
   type restoreArchivedAgent,
   type setPressureFeatures,
 } from "../shared/pressure";
 
 const run = promisify(execFile);
+type Reach = PressureStatus["reach"];
+
+/** A failed run, sorted into something the UI can explain. */
+class RunError extends Error {
+  constructor(
+    readonly reach: Reach,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 interface Target {
-  mode: "local" | "ssh";
+  machine: Machine;
   label: string;
   exec(args: string[]): Promise<string>;
 }
 
-function resolveTarget(s: ConnectionSettings): Target {
-  if (!COMMAND_PATH.test(s.command)) throw new Error(`Command path "${s.command}" has unsupported characters.`);
-  if (s.mode === "local") {
-    const command = s.command.replace(/^~(?=\/|$)/, homedir());
+function lastLine(text: unknown): string {
+  return String(text ?? "").trim().split("\n").pop() ?? "";
+}
+
+function resolveTarget(machine: Machine): Target {
+  if (!COMMAND_PATH.test(machine.command)) {
+    throw new RunError("misconfigured", `Command path "${machine.command}" has unsupported characters.`);
+  }
+  if (machine.mode === "local") {
+    const command = machine.command.replace(/^~(?=\/|$)/, homedir());
     return {
-      mode: "local",
-      label: s.label || hostname().split(".")[0],
-      exec: async args => (await run(command, args, { timeout: 20_000 })).stdout,
+      machine,
+      label: machine.label || hostname().split(".")[0],
+      async exec(args) {
+        try {
+          return (await run(command, args, { timeout: 20_000 })).stdout;
+        } catch (error) {
+          const e = error as NodeJS.ErrnoException & { stderr?: string };
+          if (e.code === "ENOENT" || e.code === "EACCES") throw new RunError("not-installed", `${command} was not found.`);
+          throw new RunError("failed", lastLine(e.stderr) || e.message);
+        }
+      },
     };
   }
-  if (!SSH_HOST.test(s.sshHost)) throw new Error("Set an SSH host in Settings → Plugins → Server Load (an ~/.ssh/config alias or user@host).");
-  // The remote shell expands a leading ~; every argument passed here is a fixed keyword or a validated id.
-  const remote = s.command.startsWith("~/") ? s.command.slice(2) : s.command;
+  if (!SSH_HOST.test(machine.sshHost)) {
+    throw new RunError("misconfigured", "Set an SSH host for this machine in Settings → Plugins → Server Load.");
+  }
+  // The remote shell expands a leading ~; every other argument is a fixed keyword or a validated id.
+  const remote = machine.command.startsWith("~/") ? machine.command.slice(2) : machine.command;
   return {
-    mode: "ssh",
-    label: s.label || s.sshHost,
-    exec: async args =>
-      (
-        await run("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", s.sshHost, remote, ...args], {
-          timeout: 25_000,
-        })
-      ).stdout,
+    machine,
+    label: machine.label || machine.sshHost,
+    async exec(args) {
+      try {
+        const sshArgs = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", machine.sshHost, remote, ...args];
+        return (await run("ssh", sshArgs, { timeout: 25_000 })).stdout;
+      } catch (error) {
+        const e = error as { code?: number | string; stderr?: string; message: string };
+        if (e.code === 255) throw new RunError("unreachable", lastLine(e.stderr) || "ssh could not connect.");
+        if (e.code === 127 || /not found|No such file/.test(String(e.stderr))) {
+          throw new RunError("not-installed", `${machine.command} was not found on ${machine.sshHost}.`);
+        }
+        throw new RunError("failed", lastLine(e.stderr) || e.message);
+      }
+    },
   };
 }
 
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const reachOf = (error: unknown): Reach => (error instanceof RunError ? error.reach : "failed");
 
-function failure(target: Pick<Target, "mode" | "label">, error: string): PressureStatus {
+function emptyStatus(machineId: string, host: string, via: Machine["mode"], reach: Reach, error: string): PressureStatus {
   return {
-    host: target.label,
-    via: target.mode,
+    machineId,
+    host,
+    via,
+    reach,
     level: null,
     reasons: [],
     memAvailablePct: null,
@@ -70,32 +109,36 @@ function failure(target: Pick<Target, "mode" | "label">, error: string): Pressur
   };
 }
 
-export function createHandlers(settings: PluginSettings<typeof connectionSettings.schema>) {
-  async function target(): Promise<Target> {
+export function createHandlers(settings: PluginSettings<typeof machinesSettings.schema>) {
+  async function target(machineId: string): Promise<Target> {
     const state = await settings.read();
-    if (state.status !== "ready") throw new Error(`Server Load settings are invalid: ${state.error}`);
-    return resolveTarget(state.values);
+    if (state.status !== "ready") throw new RunError("misconfigured", `Server Load settings are invalid: ${state.error}`);
+    const machine = state.values.machines.find(m => m.id === machineId);
+    if (!machine) throw new RunError("misconfigured", "That machine is no longer in Settings → Plugins → Server Load.");
+    return resolveTarget(machine);
   }
 
-  async function status(): Promise<PressureStatus> {
+  async function status({ machineId }: RpcInput<typeof getPressureStatus>): Promise<PressureStatus> {
     let t: Target;
     try {
-      t = await target();
+      t = await target(machineId);
     } catch (error) {
-      return failure({ mode: "local", label: hostname().split(".")[0] }, message(error));
+      return emptyStatus(machineId, machineId, "local", reachOf(error), describe(error));
     }
     let raw: Record<string, unknown>;
     try {
       raw = JSON.parse(await t.exec(["status", "--json"]));
     } catch (error) {
-      return failure(t, `Could not run server-pressure on ${t.label}: ${message(error)}`);
+      return emptyStatus(machineId, t.label, t.machine.mode, reachOf(error), describe(error));
     }
     const num = (key: string) => (typeof raw[key] === "number" ? (raw[key] as number) : null);
     const level = raw.level === "green" || raw.level === "yellow" || raw.level === "red" ? raw.level : null;
     const switches = (raw.switches ?? {}) as Record<string, unknown>;
     return {
+      machineId,
       host: t.label,
-      via: t.mode,
+      via: t.machine.mode,
+      reach: "ok",
       level,
       reasons: Array.isArray(raw.reasons) ? raw.reasons.map(String) : [],
       memAvailablePct: num("mem_available_pct"),
@@ -114,19 +157,19 @@ export function createHandlers(settings: PluginSettings<typeof connectionSetting
     };
   }
 
-  async function set({ features, on }: RpcInput<typeof setPressureFeatures>): Promise<PressureStatus> {
+  async function set({ machineId, features, on }: RpcInput<typeof setPressureFeatures>): Promise<PressureStatus> {
     try {
-      await (await target()).exec([on ? "on" : "off", ...features]);
+      await (await target(machineId)).exec([on ? "on" : "off", ...features]);
     } catch (error) {
-      const current = await status();
-      return { ...current, error: `Could not switch ${features.join(", ")} ${on ? "on" : "off"}: ${message(error)}` };
+      const current = await status({ machineId });
+      return { ...current, error: `Could not switch ${features.join(", ")} ${on ? "on" : "off"}: ${describe(error)}` };
     }
-    return status();
+    return status({ machineId });
   }
 
-  async function archived(): Promise<{ agents: ArchivedAgent[]; error: string | null }> {
+  async function archived({ machineId }: RpcInput<typeof getArchivedAgents>): Promise<{ agents: ArchivedAgent[]; error: string | null }> {
     try {
-      const rows = JSON.parse(await (await target()).exec(["archived", "--json", "--limit", "40"])) as Array<
+      const rows = JSON.parse(await (await target(machineId)).exec(["archived", "--json", "--limit", "40"])) as Array<
         Record<string, unknown>
       >;
       return {
@@ -142,17 +185,17 @@ export function createHandlers(settings: PluginSettings<typeof connectionSetting
         error: null,
       };
     } catch (error) {
-      return { agents: [], error: `Could not read the archive log: ${message(error)}` };
+      return { agents: [], error: `Could not read the archive log: ${describe(error)}` };
     }
   }
 
-  async function restore({ id }: RpcInput<typeof restoreArchivedAgent>) {
+  async function restore({ machineId, id }: RpcInput<typeof restoreArchivedAgent>) {
     try {
-      await (await target()).exec(["restore", id]);
+      await (await target(machineId)).exec(["restore", id]);
     } catch (error) {
-      return { ...(await archived()), error: `Could not restore ${id}: ${message(error)}` };
+      return { ...(await archived({ machineId })), error: `Could not restore ${id}: ${describe(error)}` };
     }
-    return archived();
+    return archived({ machineId });
   }
 
   return { status, set, archived, restore };
