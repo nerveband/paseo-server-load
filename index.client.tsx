@@ -1,24 +1,32 @@
-import type { PluginClientContext } from "@getpaseo/plugin/client";
+import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { MainSurface } from "./client/main";
 import { ConnectionSettingsScreen } from "./client/settings";
 
-// addSurface/addSidebarItem are deprecated in Paseo 0.13 but are the sidebar API that every
-// release from 0.9.2 understands. Move to addScreen/addSidebarHeaderItem when 0.13 is the floor.
+function ServerLoadItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+  return (
+    <SidebarRow
+      icon="Activity"
+      active={currentScreen?.screenId === "main"}
+      onPress={() => openScreen({ screenId: "main" })}
+    />
+  );
+}
+
 export default function contribute(client: PluginClientContext) {
-  client.addSurface("main", MainSurface);
-  client.addSidebarItem({
+  client.addScreen({ id: "main", title: "Server Load", Component: MainSurface });
+  client.addSidebarHeaderItem({
     id: "server-load",
     title: "Server Load",
-    icon: "Activity",
-    surface: "main",
+    Component: ServerLoadItem,
   });
   client.addCommandCenterItem({
     id: "open-server-load",
     title: "Open Server Load",
     icon: "Activity",
     context: "global",
-    onSelect({ openSurface }) {
-      openSurface("main");
+    onSelect({ openScreen }) {
+      openScreen({ screenId: "main" });
     },
   });
   client.addCommandCenterItem({

@@ -46,7 +46,7 @@ To update later: `git -C ~/src/paseo-server-load pull && ~/src/paseo-server-load
 paseo plugin install git:nerveband/paseo-server-load
 ```
 
-Paseo 0.9.2 or later. The plugin appears as **Server Load** in the sidebar and in the command center.
+Paseo 0.13.0 or later. The plugin appears as **Server Load** in the sidebar and in the command center.
 
 ## Watching several machines
 
